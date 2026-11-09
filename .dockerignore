@@ -1,0 +1,9 @@
+.git
+.github
+.venv
+.regress
+out
+tests
+**/__pycache__
+.pytest_cache
+.env

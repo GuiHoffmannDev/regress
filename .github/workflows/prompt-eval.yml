@@ -1,0 +1,106 @@
+name: prompt-eval
+
+on:
+  pull_request:
+    paths: ["prompts/**", "golden/**", "regress/**"]
+  push:
+    branches: [main]
+    paths: ["prompts/**", "golden/**", "regress/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: prompt-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    # For Ollama, point EVAL_RUNNER at a self-hosted runner label (e.g. "self-hosted")
+    # on a machine that runs Ollama, or set OPENAI_BASE_URL to an Ollama server CI can reach.
+    runs-on: ${{ vars.EVAL_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Unit tests
+        run: pytest -q
+
+      # Run history lives in a GitHub Actions cache. Only main saves it, so every PR is
+      # compared against the latest main run, not against earlier pushes to the same PR.
+      - name: Restore run history
+        uses: actions/cache/restore@v4
+        with:
+          path: .regress/history.db
+          key: eval-history-${{ github.run_id }}
+          restore-keys: eval-history-
+
+      - name: Run eval
+        id: eval
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          JUDGE_MODEL: ${{ vars.JUDGE_MODEL }}
+          JUDGE_REASONING_EFFORT: ${{ vars.JUDGE_REASONING_EFFORT }}
+          REGRESS_CONCURRENCY: ${{ vars.REGRESS_CONCURRENCY }}
+          REGRESS_WARN_DELTA: ${{ vars.REGRESS_WARN_DELTA }}
+          REGRESS_CRITICAL_DELTA: ${{ vars.REGRESS_CRITICAL_DELTA }}
+          REGRESS_DRIFT_FLOOR: ${{ vars.REGRESS_DRIFT_FLOOR }}
+          REGRESS_DRIFT_WINDOW: ${{ vars.REGRESS_DRIFT_WINDOW }}
+          REGRESS_MIN_SUMMARY_SCORE: ${{ vars.REGRESS_MIN_SUMMARY_SCORE }}
+        run: regress run --no-notify
+
+      - name: Upload report
+        id: upload
+        if: always() && hashFiles('out/report.html') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.run_id }}
+          path: out/
+          retention-days: 30
+
+      - name: Link report in PR comment
+        if: always() && hashFiles('out/comment.md') != ''
+        env:
+          REPORT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: printf '\n[Full HTML diff report](%s) (download the artifact and open report.html)\n' "$REPORT_URL" >> out/comment.md
+
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request' && hashFiles('out/comment.md') != ''
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: prompt-eval
+          path: out/comment.md
+
+      - name: Slack alert
+        if: always() && hashFiles('out/summary.json') != ''
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPORT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: regress notify --summary out/summary.json --report-url "$REPORT_URL"
+
+      - name: Save run history
+        if: always() && github.ref == 'refs/heads/main' && hashFiles('.regress/history.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .regress/history.db
+          key: eval-history-${{ github.run_id }}
+
+      # Mark this check as required in branch protection to block merges on critical regressions.
+      - name: Block merge on critical regression
+        if: steps.eval.outcome == 'failure'
+        run: |
+          echo "::error::Eval failed: critical regression, or the eval itself crashed. See the report and logs."
+          exit 1
